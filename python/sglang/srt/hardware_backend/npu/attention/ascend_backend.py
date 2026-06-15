@@ -63,6 +63,8 @@ class ForwardMetadata:
     seq_lens_list_cumsum: Optional[List[int]] = None
     seq_lens: Optional[torch.Tensor] = None
     actual_seq_lengths_q: Optional[torch.Tensor] = None
+    actual_seq_lengths_q_pa: Optional[torch.Tensor] = None
+    actual_seq_lengths_q_cmp: Optional[torch.Tensor] = None
     actual_seq_lengths_kv: Optional[torch.Tensor] = None
 
     # prefix cache
@@ -1060,7 +1062,7 @@ class AscendAttnBackend(AttentionBackend):
                         if not layer.is_cross_attention
                         else forward_batch.encoder_out_cache_loc
                     )
-                    forward_batch.token_to_kv_pool.set_kv_buffer(layer, cache_loc, k, v)
+                forward_batch.token_to_kv_pool.set_kv_buffer(layer, cache_loc, k, v)
 
             k_cache = forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id)
             v_cache = forward_batch.token_to_kv_pool.get_value_buffer(layer.layer_id)
@@ -1947,6 +1949,7 @@ class AscendAttnBackend(AttentionBackend):
         topk_indices: Optional[torch.Tensor] = None,
         sinks: Optional[torch.Tensor] = None,
         slopes: Optional[torch.Tensor] = None,
+        **kwargs,
     ):
         if is_mla_preprocess_enabled() and self.use_mla:
             # MLAPO does saving kv_cache
@@ -1986,7 +1989,10 @@ class AscendAttnBackend(AttentionBackend):
                     if not layer.is_cross_attention
                     else forward_batch.encoder_out_cache_loc
                 )
-                forward_batch.token_to_kv_pool.set_kv_buffer(layer, cache_loc, k, v)
+                try:
+                    forward_batch.token_to_kv_pool.set_kv_buffer(layer, cache_loc, k, v)
+                except NotImplementedError:
+                    pass  # V4 pool handles KV write via store_cache in MQALayer
             num_tokens = q.shape[0]
             k_cache = forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id)
             v_cache = forward_batch.token_to_kv_pool.get_value_buffer(layer.layer_id)
@@ -2275,10 +2281,21 @@ class AscendAttnMultiStepDraftBackend:
         self.topk = topk
         self.speculative_num_steps = speculative_num_steps
 
+        from sglang.srt.configs.model_config import is_deepseek_v4
+
+        if is_deepseek_v4(model_runner.model_config.hf_config):
+            from sglang.srt.hardware_backend.npu.attention.ascend_dsv4_backend import (
+                DeepseekV4AscendAttnBackend,
+            )
+
+            backend_cls = DeepseekV4AscendAttnBackend
+        else:
+            backend_cls = AscendAttnBackend
+
         self.attn_backends = []
         for step_id in range(self.speculative_num_steps):
             self.attn_backends.append(
-                AscendAttnBackend(model_runner, speculative_step_id=step_id)
+                backend_cls(model_runner, speculative_step_id=step_id)
             )
 
     def common_template(self, forward_batch: ForwardBatch, call_fn: int):

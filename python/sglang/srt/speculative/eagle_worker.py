@@ -680,6 +680,8 @@ class EAGLEWorker(TpModelWorker):
                     last_loc,
                     extend_num_tokens,
                     backup_state=True,
+                    req_pool_indices=batch.req_pool_indices,
+                    batch=batch,
                 )
             )
 

@@ -1,4 +1,5 @@
 import logging
+import os
 from copy import copy
 from dataclasses import dataclass
 from typing import List, Optional, Tuple
@@ -143,6 +144,16 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
                 batch.req_pool_indices,
                 prefix_lens,
             )
+            _verify_compress = (
+                os.environ.get("SGLANG_DSV4_NPU_VERIFY_COMPRESS") != "0"
+            )
+            _dsv4_state_lens = None
+            if _verify_compress:
+                batch._compute_dsv4_state_lens_verify(
+                    prefix_lens_cpu.tolist(), self.draft_token_num
+                )
+                _dsv4_state_lens = getattr(batch, "dsv4_state_lens", None)
+
             batch.out_cache_loc = alloc_paged_token_slots_extend(
                 batch.tree_cache,
                 prefix_lens,
@@ -151,7 +162,32 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
                 end_offset_cpu,
                 last_loc,
                 len(batch.input_ids),
+                req_pool_indices=batch.req_pool_indices,
+                dsv4_state_lens=_dsv4_state_lens,
+                batch=batch,
             )
+
+            from sglang.srt.utils import is_npu
+
+            if is_npu():
+                from sglang.srt.hardware_backend.npu.dsv4_common_hooks import (
+                    maybe_write_dsv4_extend,
+                )
+
+                maybe_write_dsv4_extend(
+                    batch,
+                    batch.req_pool_indices.cpu(),
+                    prefix_lens_cpu,
+                    end_offset_cpu,
+                )
+
+            if _verify_compress:
+                for _req in batch.reqs:
+                    if hasattr(_req, "_dsv4_swa_c4_off"):
+                        _req.c4_state_alloc_offset = _req._dsv4_swa_c4_off
+                        _req.c128_state_alloc_offset = _req._dsv4_swa_c128_off
+                        del _req._dsv4_swa_c4_off
+                        del _req._dsv4_swa_c128_off
 
         bs = batch.batch_size()
         assign_req_to_token_pool_func(
@@ -425,6 +461,7 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
         predict_cpu = predict.tolist()
         has_finished = False
         think_end_id = batch.model_config.think_end_id
+        _dsv4_accept_lens = []  # Part D: per-req accepted-token count
 
         # Iterate every accepted token and check if req has finished after append the token
         # should be checked BEFORE free kv cache slots
@@ -468,6 +505,32 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
             )
             req.spec_num_correct_drafts += num_correct_drafts_this_req
             req.update_spec_correct_drafts_histogram(num_correct_drafts_this_req)
+            _dsv4_accept_lens.append(num_accept_tokens)
+
+        if os.environ.get("SGLANG_DSV4_NPU_VERIFY_COMPRESS") != "0":
+            _alloc = batch.tree_cache.token_to_kv_pool_allocator
+            if (
+                hasattr(_alloc, "c4_state_attn_allocator")
+                and _alloc.c4_state_attn_allocator is not None
+            ):
+                _rtp = batch.req_to_token_pool
+                _nd = self.draft_token_num
+                _rpi = batch.req_pool_indices.tolist()
+                for _i, _req in enumerate(batch.reqs):
+                    _c0 = getattr(_req, "_dsv4_verify_committed", None)
+                    if hasattr(_req, "_dsv4_verify_committed"):
+                        del _req._dsv4_verify_committed
+                    _K = _dsv4_accept_lens[_i]
+                    _nrej = _nd - _K
+                    if _nrej <= 0 or _c0 is None:
+                        continue
+                    _ridx = _rpi[_i]
+                    _c4 = _rtp.req_to_token_c4_state[_ridx, _c0 + _K : _c0 + _nd]
+                    _alloc.c4_state_attn_allocator.free(_c4.to(torch.int64))
+                    _c128 = _rtp.req_to_token_c128_state[_ridx, _c0 + _K : _c0 + _nd]
+                    _alloc.c128_state_attn_allocator.free(_c128.to(torch.int64))
+                    _req.c4_state_kv_len -= _nrej
+                    _req.c128_state_kv_len -= _nrej
 
         if has_finished:
             num_correct_drafts = (accept_index != -1).sum(dim=1) - 1

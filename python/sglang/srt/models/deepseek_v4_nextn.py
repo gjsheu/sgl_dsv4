@@ -78,14 +78,12 @@ class DeepseekV4ModelNextN(nn.Module):
             prefix=add_prefix("h_proj", prefix),
         )
 
-        layer_name = "decoder"
-
         self.decoder = DeepseekV4DecoderLayer(
             config,
             layer_id=0,
             quant_config=quant_config,
             is_nextn=True,
-            prefix=add_prefix(layer_name, prefix),
+            prefix="mtp.0",
             alt_streams=None,
             compress_ratio_override=COMPRESS_RATIO_NEXTN_LAYER,
         )

@@ -159,7 +159,22 @@ class EagleDraftInputV2Mixin:
                 nxt_kv_lens_cpu,
                 last_loc,
                 num_needed_tokens,
+                req_pool_indices=batch.req_pool_indices,
+                batch=batch,
             )
+            from sglang.srt.utils import is_npu
+
+            if is_npu():
+                from sglang.srt.hardware_backend.npu.dsv4_common_hooks import (
+                    maybe_write_dsv4_extend,
+                )
+
+                maybe_write_dsv4_extend(
+                    batch,
+                    batch.req_pool_indices.cpu(),
+                    cur_kv_lens_cpu,
+                    nxt_kv_lens_cpu,
+                )
 
         assign_req_to_token_pool_func(
             batch.req_pool_indices,

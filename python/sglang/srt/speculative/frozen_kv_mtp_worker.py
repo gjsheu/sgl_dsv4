@@ -203,7 +203,26 @@ class FrozenKVMTPWorker(TpModelWorker):
 
     def _init_draft_attn_backend(self):
         if self.topk == 1:
-            return self.draft_model_runner.attn_backend
+            backend = self.draft_model_runner.attn_backend
+            from sglang.srt.utils import is_npu as _is_npu
+
+            if _is_npu():
+                from sglang.srt.hardware_backend.npu.attention.ascend_dsv4_backend import (
+                    DeepseekV4AscendAttnBackend,
+                )
+
+            if isinstance(backend, DeepseekV4AscendAttnBackend):
+                return backend
+            logger.warning(
+                "Draft model backend is %s, replacing with DeepseekV4AscendAttnBackend for V4 model.",
+                type(backend).__name__,
+            )
+            backend = DeepseekV4AscendAttnBackend(
+                self.draft_model_runner
+            )
+            self.draft_model_runner.attn_backend = backend
+            self.draft_model_runner.decode_attn_backend = backend
+        return backend
 
         backend_type = self._resolve_draft_backend_type()
         if backend_type != "triton":
@@ -677,6 +696,7 @@ class FrozenKVMTPWorker(TpModelWorker):
             self._set_positions(forward_batch)
 
             with self._target_kv_pool_view(forward_batch):
+                forward_batch.attn_backend = self.draft_attn_backend
                 logits_output = self.draft_model_runner.forward(
                     forward_batch, skip_attn_backend_init=True
                 ).logits_output

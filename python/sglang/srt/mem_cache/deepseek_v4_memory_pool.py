@@ -643,11 +643,12 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
         self.layer_mapping: List[DeepSeekV4LayerItem] = []
 
         for ratio in self.compression_ratios:
-            # Dense layers (compress_ratio=0) share the uncompressed SWA bucket.
-            if ratio == 0:
+            # V4-Flash uses ratio=1 for dense edge layers. Both 0 and 1 mean
+            # no compressed KV/state, sharing the uncompressed SWA bucket.
+            if ratio in (0, 1):
                 self.layer_mapping.append(
                     DeepSeekV4LayerItem(
-                        compress_ratio=0,
+                        compress_ratio=ratio,
                         compress_layer_id=c1_cnt,
                     )
                 )
