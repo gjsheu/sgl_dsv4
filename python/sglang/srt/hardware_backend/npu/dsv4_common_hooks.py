@@ -352,3 +352,54 @@ def _free_state_range(
     free_slots = getattr(pool, table_attr)[req.req_pool_idx, offset:watermark]
     state_allocator.free(free_slots.to(torch.int64))
     setattr(req, offset_attr, watermark)
+
+
+def free_rejected_compress_pages(
+    allocator,
+    table_row: torch.Tensor,
+    commit_pos: int,
+    reject_hi: int,
+    page_size: int,
+) -> None:
+    """Page-safe reclaim of c{N}[_state] slots that target-verify allocated for
+    REJECTED draft tokens.
+
+    During MTP target-verify the DSV4 allocator reserves c4/c128 KV *and* state
+    slots for the whole draft window ``[committed, committed+draft_token_num)``,
+    but only ``K`` of those tokens are accepted. The slots for the rejected tail
+    ``[commit_pos, reject_hi)`` (``commit_pos = committed+K``) must be returned.
+
+    ``table_row`` is one request's row of ``req_to_token_c{N}`` (compressed-
+    position indexed) or ``req_to_token_c{N}_state`` (raw-position indexed); its
+    entries are physical slot ids.
+
+    The NPU paged allocator frees by **whole page** (``allocator_npu.py`` /
+    ``mem_cache/allocator.py`` ``free``: ``unique(free_index // page_size)`` →
+    page ids) with no per-slot refcount, and in the non-disagg case
+    (``need_sort=False``) returns freed pages to ``free_pages`` immediately and
+    LIFO. So freeing a rejected slot that *shares a page* with a committed slot
+    would hand a still-live page to the very next allocation and alias another
+    request's KV/state — silent numerical corruption, not just a leak. We
+    therefore free a rejected slot only when its page holds no committed slot,
+    i.e. its page differs from the last committed slot's page. Mid-page rejected
+    slots are left untouched: the request rolls its logical length back to
+    ``commit_pos`` and rewrites those exact slots in place on its next extend
+    (``last_loc`` continuity), so they are not leaked. Only a fully rejected
+    *fresh* page (opened when the draft window crossed a page boundary) is
+    returned to the allocator. No-op when the allocator is absent or the
+    rejected range is empty.
+    """
+    if allocator is None or reject_hi <= commit_pos:
+        return
+    rej = table_row[commit_pos:reject_hi].to(torch.int64)
+    if commit_pos > 0:
+        # Keep any slot that shares the last committed slot's page — freeing it
+        # would return a page that still holds committed data.
+        shared_page = table_row[commit_pos - 1].to(torch.int64) // page_size
+        rej = rej[(rej // page_size) != shared_page]
+    # Never hand back page 0: it is the block-0 skip sentinel (unallocated
+    # columns read as 0). Excludes the whole page, not just slot id 0, matching
+    # the sgl_0610 reference (`_pages > 0`).
+    rej = rej[(rej // page_size) != 0]
+    if rej.numel() > 0:
+        allocator.free(rej)
