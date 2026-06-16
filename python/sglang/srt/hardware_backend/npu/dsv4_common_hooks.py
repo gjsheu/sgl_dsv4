@@ -24,12 +24,132 @@ into the allocator itself.
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
+import os
+from typing import TYPE_CHECKING, Optional
 
 import torch
 
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
+    from sglang.srt.model_executor.forward_batch_info import DSV4StateLens
+
+
+def compute_dsv4_verify_state_lens(
+    batch: "ScheduleBatch",
+    committed_lens_cpu: list,
+    draft_token_num: int,
+) -> Optional["DSV4StateLens"]:
+    """Build DSV4-NPU c{4,128}_state alloc lens for target verify.
+
+    The allocator owns the req state mutation because it also owns the DSV4
+    state pool policy. Non-DSV4 paths return None.
+    """
+    if os.environ.get("SGLANG_DSV4_NPU_VERIFY_COMPRESS") == "0":
+        return None
+
+    allocator = batch.token_to_kv_pool_allocator
+    compute_fn = getattr(allocator, "compute_dsv4_state_lens_verify", None)
+    if compute_fn is None:
+        return None
+    return compute_fn(batch.reqs, committed_lens_cpu, draft_token_num)
+
+
+def maybe_write_dsv4_verify_extend(
+    batch: "ScheduleBatch",
+    prefix_lens_cpu: torch.Tensor,
+    seq_lens_cpu: torch.Tensor,
+) -> None:
+    """Post target-verify alloc hook.
+
+    Verify temporarily points c{4,128}_state write offsets at the committed
+    boundary so the compressor writes the draft interval. Restore the normal SWA
+    offsets after the req-to-token state tables are populated.
+    """
+    try:
+        if getattr(batch, "out_cache_loc_dsv4", None) is not None:
+            maybe_write_dsv4_extend(
+                batch,
+                batch.req_pool_indices.cpu(),
+                prefix_lens_cpu,
+                seq_lens_cpu,
+            )
+    finally:
+        _restore_dsv4_verify_offsets(batch)
+
+
+def _restore_dsv4_verify_offsets(batch: "ScheduleBatch") -> None:
+    for req in batch.reqs:
+        if hasattr(req, "_dsv4_swa_c4_off"):
+            req.c4_state_alloc_offset = req._dsv4_swa_c4_off
+            req.c128_state_alloc_offset = req._dsv4_swa_c128_off
+            del req._dsv4_swa_c4_off
+            del req._dsv4_swa_c128_off
+
+
+def recycle_dsv4_verify_rejected_pages(
+    batch: "ScheduleBatch",
+    accept_lens: list,
+    draft_token_num: int,
+) -> None:
+    """Return fully rejected c{4,128} KV/state pages after target verify."""
+    if os.environ.get("SGLANG_DSV4_NPU_VERIFY_COMPRESS") == "0":
+        return
+
+    allocator = batch.tree_cache.token_to_kv_pool_allocator
+    if (
+        not hasattr(allocator, "c4_state_attn_allocator")
+        or allocator.c4_state_attn_allocator is None
+    ):
+        return
+
+    req_to_token_pool = batch.req_to_token_pool
+    req_pool_indices = batch.req_pool_indices.tolist()
+    page_size = batch.tree_cache.page_size
+    for i, req in enumerate(batch.reqs):
+        committed = getattr(req, "_dsv4_verify_committed", None)
+        if hasattr(req, "_dsv4_verify_committed"):
+            del req._dsv4_verify_committed
+        accept_len = accept_lens[i]
+        reject_len = draft_token_num - accept_len
+        if reject_len <= 0 or committed is None:
+            continue
+
+        req_pool_idx = req_pool_indices[i]
+        reject_lo = committed + accept_len
+        reject_hi = committed + draft_token_num
+
+        # State pools are raw-position indexed.
+        free_rejected_compress_pages(
+            allocator.c4_state_attn_allocator,
+            req_to_token_pool.req_to_token_c4_state[req_pool_idx],
+            reject_lo,
+            reject_hi,
+            page_size,
+        )
+        free_rejected_compress_pages(
+            allocator.c128_state_attn_allocator,
+            req_to_token_pool.req_to_token_c128_state[req_pool_idx],
+            reject_lo,
+            reject_hi,
+            page_size,
+        )
+        # Compressed-KV pools are compressed-position indexed.
+        free_rejected_compress_pages(
+            getattr(allocator, "c4_attn_allocator", None),
+            req_to_token_pool.req_to_token_c4[req_pool_idx],
+            reject_lo // 4,
+            reject_hi // 4,
+            page_size,
+        )
+        free_rejected_compress_pages(
+            getattr(allocator, "c128_attn_allocator", None),
+            req_to_token_pool.req_to_token_c128[req_pool_idx],
+            reject_lo // 128,
+            reject_hi // 128,
+            page_size,
+        )
+        req.c4_state_kv_len -= reject_len
+        req.c128_state_kv_len -= reject_len
 
 
 def maybe_write_dsv4_extend(
@@ -91,8 +211,9 @@ def maybe_write_dsv4_extend(
 
     # c4_state / c128_state writes: tail-only. Bundle has length
     # ``sum(c{N}_state_alloc_len_i)`` (NOT total raw extend tokens) per
-    # ScheduleBatch._compute_dsv4_state_lens_extend. Each req's slot ids go
-    # at raw positions ``[req.c{N}_state_alloc_offset, seq_len)`` —
+    # DSV4NPUTokenToKVPoolAllocator.compute_dsv4_state_lens_extend.
+    # Each req's slot ids go at raw positions
+    # ``[req.c{N}_state_alloc_offset, seq_len)`` —
     # corresponds to the trailing window the compressor reads / writes.
     if bundle.out_c4_state_loc is not None and hasattr(
         req_to_token_pool, "write_c4_state"

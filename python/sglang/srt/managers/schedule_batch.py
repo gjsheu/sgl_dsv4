@@ -77,7 +77,6 @@ from sglang.srt.mem_cache.radix_cache import RadixKey
 from sglang.srt.mem_cache.swa_memory_pool import SWATokenToKVPoolAllocator
 from sglang.srt.model_executor.forward_batch_info import (
     CaptureHiddenMode,
-    DSV4StateLens,
     ForwardBatch,
     ForwardMode,
 )
@@ -2721,64 +2720,6 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                             self._evict_swa(req, pre_len)
                 else:
                     self._evict_swa(req, pre_len)
-
-    def _compute_dsv4_state_lens_verify(
-        self, committed_lens_cpu: List[int], draft_token_num: int
-    ) -> None:
-        """DSV4-NPU c{4,128}_state alloc lens for target verify.
-
-        Target verify processes ``draft_token_num`` draft tokens per request
-        starting at each request's committed length. Allocate one state slot per
-        draft token and temporarily point the state alloc offset at the committed
-        boundary so the fused compressor writes the verify interval.
-        """
-        allocator = self.token_to_kv_pool_allocator
-        if (
-            not hasattr(allocator, "c4_state_attn_allocator")
-            or allocator.c4_state_attn_allocator is None
-        ):
-            return
-
-        c4_prefix_list: List[int] = []
-        c4_seq_list: List[int] = []
-        c128_prefix_list: List[int] = []
-        c128_seq_list: List[int] = []
-        for req, committed in zip(self.reqs, committed_lens_cpu):
-            committed = int(committed)
-            prev_c4 = getattr(req, "c4_state_kv_len", 0)
-            prev_c128 = getattr(req, "c128_state_kv_len", 0)
-            new_c4 = prev_c4 + draft_token_num
-            new_c128 = prev_c128 + draft_token_num
-
-            c4_prefix_list.append(prev_c4)
-            c4_seq_list.append(new_c4)
-            c128_prefix_list.append(prev_c128)
-            c128_seq_list.append(new_c128)
-
-            req.c4_state_kv_len = new_c4
-            req.c128_state_kv_len = new_c128
-            req._dsv4_swa_c4_off = getattr(req, "c4_state_alloc_offset", 0)
-            req._dsv4_swa_c128_off = getattr(req, "c128_state_alloc_offset", 0)
-            req.c4_state_alloc_offset = committed
-            req.c128_state_alloc_offset = committed
-            req._dsv4_verify_committed = committed
-
-        c4_prefix_lens_cpu = torch.tensor(c4_prefix_list, dtype=torch.int64)
-        c4_seq_lens_cpu = torch.tensor(c4_seq_list, dtype=torch.int64)
-        c128_prefix_lens_cpu = torch.tensor(c128_prefix_list, dtype=torch.int64)
-        c128_seq_lens_cpu = torch.tensor(c128_seq_list, dtype=torch.int64)
-        self.dsv4_state_lens = DSV4StateLens(
-            c4_prefix_lens=c4_prefix_lens_cpu.to(self.device, non_blocking=True),
-            c4_prefix_lens_cpu=c4_prefix_lens_cpu,
-            c4_seq_lens=c4_seq_lens_cpu.to(self.device, non_blocking=True),
-            c4_seq_lens_cpu=c4_seq_lens_cpu,
-            c4_extend_num_tokens=len(self.reqs) * draft_token_num,
-            c128_prefix_lens=c128_prefix_lens_cpu.to(self.device, non_blocking=True),
-            c128_prefix_lens_cpu=c128_prefix_lens_cpu,
-            c128_seq_lens=c128_seq_lens_cpu.to(self.device, non_blocking=True),
-            c128_seq_lens_cpu=c128_seq_lens_cpu,
-            c128_extend_num_tokens=len(self.reqs) * draft_token_num,
-        )
 
     def _evict_swa(self, req: Req, pre_len: int):
         assert self.tree_cache.supports_swa(), "prefix cache must support swa"

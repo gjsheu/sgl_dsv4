@@ -374,30 +374,6 @@ def _compute_dsv4_state_lens(batch, *, is_decode: bool):
     )
 
 
-def _collect_dsv4_state_kwargs(batch) -> Optional[dict]:
-    """Pull the per-req c{4,128}_state pool lens off the batch.
-
-    Populated by eagle_info prepare_for_verify when verify compression is
-    enabled; absent otherwise. Returns None when the helper did not run
-    (CUDA / non-V4 paths), so alloc_paged_token_slots_extend forwarding
-    stays a no-op.
-    """
-    if getattr(batch, "c4_state_seq_lens", None) is None:
-        return None
-    return {
-        "c4_state_prefix_lens": batch.c4_state_prefix_lens,
-        "c4_state_prefix_lens_cpu": batch.c4_state_prefix_lens_cpu,
-        "c4_state_seq_lens": batch.c4_state_seq_lens,
-        "c4_state_seq_lens_cpu": batch.c4_state_seq_lens_cpu,
-        "c4_state_extend_num_tokens": batch.c4_state_extend_num_tokens,
-        "c128_state_prefix_lens": batch.c128_state_prefix_lens,
-        "c128_state_prefix_lens_cpu": batch.c128_state_prefix_lens_cpu,
-        "c128_state_seq_lens": batch.c128_state_seq_lens,
-        "c128_state_seq_lens_cpu": batch.c128_state_seq_lens_cpu,
-        "c128_state_extend_num_tokens": batch.c128_state_extend_num_tokens,
-    }
-
-
 def alloc_paged_token_slots_extend(
     tree_cache: BasePrefixCache,
     prefix_lens: torch.Tensor,
@@ -410,7 +386,6 @@ def alloc_paged_token_slots_extend(
     req_pool_indices: Optional[torch.Tensor] = None,
     dsv4_state_lens: Optional["DSV4StateLens"] = None,
     batch=None,
-    dsv4_state_kwargs: Optional[dict] = None,
 ):
     # Over estimate the number of tokens: assume each request needs a new page.
     allocator = tree_cache.token_to_kv_pool_allocator
@@ -433,8 +408,6 @@ def alloc_paged_token_slots_extend(
             extra_alloc_kwargs["req_to_token_pool"] = batch.req_to_token_pool
         if dsv4_state_lens is not None:
             extra_alloc_kwargs["dsv4_state_lens"] = dsv4_state_lens
-        if dsv4_state_kwargs is not None:
-            extra_alloc_kwargs.update(dsv4_state_kwargs)
 
     out = allocator.alloc_extend(
         prefix_lens,

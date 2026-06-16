@@ -10,7 +10,7 @@ Per ``alloc_extend`` / ``alloc_decode``:
      (``seq_len // ratio - prefix_len // ratio``) — via the standard
      :class:`NPUPagedTokenToKVPoolAllocator` over the pool's c4/c128 KV buffers.
   3. Allocate the c4/c128 compress-state slots the same way, tail-only per req,
-     using the per-req lens the scheduler packed into ``DSV4StateLens``.
+     using the per-req lens this allocator packed into ``DSV4StateLens``.
   4. Return a :class:`DSV4OutCacheLoc` bundling all five slot families.
 
 State slots are paged because the NPU fused compressor runs ``cache_mode=1``; the
@@ -180,7 +180,7 @@ class DSV4NPUTokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
 
         The state pool is a separate paged slot space; each req allocates only
         its trailing window (cumulative lens precomputed by
-        ``ScheduleBatch._compute_dsv4_state_lens_*`` and passed via
+        ``compute_dsv4_state_lens_*`` on this allocator and passed via
         ``DSV4StateLens``). ``state_last_loc`` is looked up from
         ``req_to_token_c{ratio}_state`` at the RAW position
         ``raw_prefix_lens - 1`` (the last position the previous extend/decode
@@ -282,7 +282,7 @@ class DSV4NPUTokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
 
         Shared by alloc_extend / alloc_decode (which differ only in how
         prefix_lens is derived). State lens are tail-only, precomputed by
-        ScheduleBatch._compute_dsv4_state_lens_*; raw prefix_lens drives the
+        compute_dsv4_state_lens_* on this allocator; raw prefix_lens drives the
         state last_loc lookup.
         """
         assert req_pool_indices is not None, (
@@ -417,6 +417,52 @@ class DSV4NPUTokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
             c4_prefix, c4_seq, c128_prefix, c128_seq,
             c4_extend_num_tokens=bs,
             c128_extend_num_tokens=bs,
+        )
+
+    def compute_dsv4_state_lens_verify(
+        self, reqs: List["Req"], committed_lens_cpu: List[int], draft_token_num: int
+    ) -> Optional[DSV4StateLens]:
+        """Per-req c{4,128}_state pool alloc lens for target verify.
+
+        Target verify processes ``draft_token_num`` draft tokens per request
+        starting at each request's committed length. Allocate one state slot per
+        draft token and temporarily point the state alloc offset at the committed
+        boundary so the fused compressor writes the verify interval.
+        """
+        if self.c4_state_attn_allocator is None:
+            return None
+
+        c4_prefix: List[int] = []
+        c4_seq: List[int] = []
+        c128_prefix: List[int] = []
+        c128_seq: List[int] = []
+        for req, committed in zip(reqs, committed_lens_cpu):
+            committed = int(committed)
+            prev_c4 = getattr(req, "c4_state_kv_len", 0)
+            prev_c128 = getattr(req, "c128_state_kv_len", 0)
+            new_c4 = prev_c4 + draft_token_num
+            new_c128 = prev_c128 + draft_token_num
+
+            c4_prefix.append(prev_c4)
+            c4_seq.append(new_c4)
+            c128_prefix.append(prev_c128)
+            c128_seq.append(new_c128)
+
+            req.c4_state_kv_len = new_c4
+            req.c128_state_kv_len = new_c128
+            req._dsv4_swa_c4_off = getattr(req, "c4_state_alloc_offset", 0)
+            req._dsv4_swa_c128_off = getattr(req, "c128_state_alloc_offset", 0)
+            req.c4_state_alloc_offset = committed
+            req.c128_state_alloc_offset = committed
+            req._dsv4_verify_committed = committed
+
+        return self._pack_state_lens(
+            c4_prefix,
+            c4_seq,
+            c128_prefix,
+            c128_seq,
+            c4_extend_num_tokens=len(reqs) * draft_token_num,
+            c128_extend_num_tokens=len(reqs) * draft_token_num,
         )
 
     def _pack_state_lens(

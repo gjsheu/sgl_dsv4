@@ -266,7 +266,7 @@ class DSV4OutCacheLoc:
 class DSV4StateLens:
     """Per-extend/decode c4/c128 compress-state pool allocation lens (DSV4-NPU).
 
-    Built by ``ScheduleBatch._compute_dsv4_state_lens_{extend,decode}`` and
+    Built by ``DSV4NPUTokenToKVPoolAllocator.compute_dsv4_state_lens_*`` and
     threaded through ``mem_cache/common.py`` to
     ``DSV4NPUTokenToKVPoolAllocator.alloc_{extend,decode}``, which consumes:
 

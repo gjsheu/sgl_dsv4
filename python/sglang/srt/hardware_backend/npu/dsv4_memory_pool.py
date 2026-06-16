@@ -107,8 +107,9 @@ def npu_state_pool_size(
     Prefill no longer drives sizing because allocation is tail-only — long
     prompts only allocate ``c{ratio}_alloc_len`` slots (``≤ tail + 128`` for
     c4, ``≤ tail`` for c128, where ``tail = seq_len % 128``), not the full raw
-    seqlen. See :meth:`ScheduleBatch._compute_dsv4_state_lens_extend` for the
-    per-req formula.
+    seqlen. See
+    :meth:`DSV4NPUTokenToKVPoolAllocator.compute_dsv4_state_lens_extend` for
+    the per-req formula.
 
     Result is in TOKEN units (matches the SGLang allocator
     ``PagedTokenToKVPoolAllocator(size, ...)`` convention where

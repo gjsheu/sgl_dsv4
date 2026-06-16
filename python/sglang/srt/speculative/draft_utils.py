@@ -202,7 +202,7 @@ class DraftBackendFactory:
         from sglang.srt.configs.model_config import is_deepseek_v4
 
         if is_deepseek_v4(self.draft_model_runner.model_config.hf_config):
-            from sglang.srt.hardware_backend.npu.attention.ascend_dsv4_backend import (
+            from sglang.srt.hardware_backend.npu.attention.ascend_dsv4_draft_backend import (
                 DeepseekV4AscendMultiStepDraftBackend,
             )
 

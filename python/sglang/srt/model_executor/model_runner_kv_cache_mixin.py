@@ -384,8 +384,9 @@ class ModelRunnerKVCacheMixin:
                 # Recompute state pool sizes for the NPU paged formula.
                 # CUDA's ring sizes (already in self.c{4,128}_state_pool_size)
                 # are dropped on the NPU dispatch. With tail-only allocation
-                # (see ScheduleBatch._compute_dsv4_state_lens_extend), the
-                # reference per-req-budget formula is sufficient regardless of
+                # (see DSV4NPUTokenToKVPoolAllocator.
+                # compute_dsv4_state_lens_extend), the reference per-req-budget
+                # formula is sufficient regardless of
                 # prefill length — long prompts only allocate ``tail+128``
                 # state slots for c4 and ``tail`` for c128 (tail = seq_len %
                 # 128), and steady-state decode is drained by sliding
