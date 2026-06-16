@@ -206,23 +206,26 @@ class FrozenKVMTPWorker(TpModelWorker):
             backend = self.draft_model_runner.attn_backend
             from sglang.srt.utils import is_npu as _is_npu
 
+            # DSV4-on-NPU draft backend swap only; keep every
+            # DeepseekV4AscendAttnBackend reference inside is_npu() so non-NPU
+            # builds don't hit a NameError on the import-less name.
             if _is_npu():
+                from sglang.srt.configs.model_config import is_deepseek_v4
                 from sglang.srt.hardware_backend.npu.attention.ascend_dsv4_backend import (
                     DeepseekV4AscendAttnBackend,
                 )
 
-            if isinstance(backend, DeepseekV4AscendAttnBackend):
-                return backend
-            logger.warning(
-                "Draft model backend is %s, replacing with DeepseekV4AscendAttnBackend for V4 model.",
-                type(backend).__name__,
-            )
-            backend = DeepseekV4AscendAttnBackend(
-                self.draft_model_runner
-            )
-            self.draft_model_runner.attn_backend = backend
-            self.draft_model_runner.decode_attn_backend = backend
-        return backend
+                if is_deepseek_v4(
+                    self.draft_model_runner.model_config.hf_config
+                ) and not isinstance(backend, DeepseekV4AscendAttnBackend):
+                    logger.warning(
+                        "Draft model backend is %s, replacing with DeepseekV4AscendAttnBackend for V4 model.",
+                        type(backend).__name__,
+                    )
+                    backend = DeepseekV4AscendAttnBackend(self.draft_model_runner)
+                    self.draft_model_runner.attn_backend = backend
+                    self.draft_model_runner.decode_attn_backend = backend
+            return backend
 
         backend_type = self._resolve_draft_backend_type()
         if backend_type != "triton":

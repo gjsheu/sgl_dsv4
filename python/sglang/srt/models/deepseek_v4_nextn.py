@@ -25,7 +25,7 @@ from sglang.srt.layers.vocab_parallel_embedding import (
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.models.deepseek_v4 import DeepseekV4DecoderLayer, DeepseekV4ForCausalLM
 from sglang.srt.server_args import get_global_server_args
-from sglang.srt.utils import add_prefix
+from sglang.srt.utils import add_prefix, is_npu
 
 logger = logging.getLogger(__name__)
 
@@ -83,7 +83,9 @@ class DeepseekV4ModelNextN(nn.Module):
             layer_id=0,
             quant_config=quant_config,
             is_nextn=True,
-            prefix="mtp.0",
+            # NPU (DSV4-Flash modelslim ckpt) registers the NEXTN decoder under
+            # "mtp.0"; keep the original "decoder" prefix on other devices.
+            prefix="mtp.0" if is_npu() else add_prefix("decoder", prefix),
             alt_streams=None,
             compress_ratio_override=COMPRESS_RATIO_NEXTN_LAYER,
         )

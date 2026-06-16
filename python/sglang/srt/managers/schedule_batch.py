@@ -2719,8 +2719,8 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                                 else pre_len
                             )
                             self._evict_swa(req, pre_len)
-                else:
-                    self._evict_swa(req, pre_len)
+                    else:
+                        self._evict_swa(req, pre_len)
 
     def _compute_dsv4_state_lens_verify(
         self, committed_lens_cpu: List[int], draft_token_num: int
