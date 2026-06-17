@@ -618,6 +618,7 @@ class DeepseekV4AscendAttnBackend(
         # [committed, committed+draft_token_num).
         _verify_compress = (
             forward_mode.is_target_verify()
+            and forward_batch.forward_mode.is_target_verify()
             and bool(self._dsv4_compress_ratios)
             and os.environ.get("SGLANG_DSV4_NPU_VERIFY_COMPRESS") != "0"
         )
@@ -724,6 +725,29 @@ class DeepseekV4AscendAttnBackend(
                                 f"{bl32.numel()} > {dst_loc.numel()}"
                             )
                             dst_loc[: bl32.numel()].copy_(bl32)
+        elif (
+            forward_mode.is_target_verify()
+            # The graph may replay a target-verify capture for an idle/padded
+            # DP rank. There is no real DSV4 allocation bundle in that case;
+            # zero the compressor metadata so captured writes land in the
+            # reserved dummy slot instead of reusing stale locs.
+            and not forward_batch.forward_mode.is_target_verify()
+            and bool(self._dsv4_compress_ratios)
+            and os.environ.get("SGLANG_DSV4_NPU_VERIFY_COMPRESS") != "0"
+        ):
+            # accuracy improved from 0.852 to 0.873 with graph
+            for tensor in (
+                fm.positions_cmp_padding_c4,
+                fm.positions_cmp_padding_c128,
+                fm.c4_loc,
+                fm.c128_loc,
+                fm.c4_state_loc,
+                fm.c128_state_loc,
+            ):
+                if tensor is not None:
+                    tensor.zero_()
+            fm.start_pos.zero_()
+            fm.seqused.zero_()
 
         # swa_loc — eager path uses pool.translate_loc_from_full_to_swa(out_cache_loc).
         # _compute_compress_locs does NOT produce this (per Task 2's design); compute
