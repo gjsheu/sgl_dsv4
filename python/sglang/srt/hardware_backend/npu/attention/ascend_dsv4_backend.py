@@ -5,7 +5,7 @@ NPU counterpart of the CUDA ``DeepseekV4AttnBackend``. Bridges V4 model code
 of ``AttentionBackend``) with ``AscendAttnBackend``. MRO: ``AscendAttnBackend``
 supplies the NPU forward / metadata surface; the V4 mixins add the c4 / c128
 compress + indexer helpers. ``forward()`` routes by ``compress_ratio``:
-0 / 1 → dense SWA (``_forward_dense``), 4 / 128 → sparse compressed
+0 → dense SWA (``_forward_dense``), 4 / 128 → sparse compressed
 (``_forward_compressed`` via ``npu_sparse_attn_sharedkv``).
 """
 
@@ -260,15 +260,7 @@ class DeepseekV4AscendAttnBackend(
         forward_mode: "ForwardMode",
         spec_info: Optional["SpecInput"],
     ):
-        """Capture-time metadata setup for V4-Flash on NPU.
-
-        Calls the base class to populate generic fields (block_tables, seq_lens,
-        actual_seq_lengths_q). Then attaches V4-specific graph buffers
-        (preallocated in _init_dsv4_graph_buffers) to the per-bs ForwardMetadata
-        and fills fixed-shape per-request tensors (actual_seq_lengths_q_pa /
-        _kv / _q_cmp). The dynamic content of the loc/page_table buffers is
-        written during replay (where the live forward_batch is available).
-        """
+        """Bind fixed DSV4 graph buffers; replay fills dynamic loc/table data."""
         super().init_forward_metadata_capture_cuda_graph(
             bs=bs,
             num_tokens=num_tokens,
@@ -281,9 +273,6 @@ class DeepseekV4AscendAttnBackend(
         metadata = self.graph_metadata[bs]
         device = self.device
 
-        # tokens_per_bs: 1 for decode/idle, speculative_num_draft_tokens for
-        # target_verify / draft_extend / draft_extend_v2. Match the base class's
-        # branch on forward_mode (lines 496-508 of ascend_backend.py).
         if (
             forward_mode.is_target_verify()
             or forward_mode.is_draft_extend_v2()
@@ -293,8 +282,6 @@ class DeepseekV4AscendAttnBackend(
         else:
             tokens_per_bs = 1
 
-        # actual_seq_lengths_q_pa: cumulative q-lengths WITH leading 0, length bs+1.
-        # Decode: [0, 1, 2, ..., bs]. Target_verify: [0, n_draft, 2n_draft, ..., bs*n_draft].
         metadata.actual_seq_lengths_q_pa = torch.arange(
             0,
             bs * tokens_per_bs + tokens_per_bs,
@@ -304,26 +291,17 @@ class DeepseekV4AscendAttnBackend(
         )
         metadata.actual_seq_lengths_q_cmp = metadata.actual_seq_lengths_q_pa.clone()
 
-        # actual_seq_lengths_kv: KV lengths per request; shape (bs,) to match
-        # eager init_forward_metadata (lines 529/551/555) and the kernel's
-        # expected layout (kernel infers bs from len(cu_seqlens_q) - 1 and
-        # reads seqused_kv with that exact length). Initialized non-zero so the
-        # captured kernel records valid attention work; replay overwrites with
-        # real seq_lens in-place.
+        # Capture needs valid non-zero lengths; replay overwrites them in-place.
         metadata.actual_seq_lengths_kv = torch.ones(
             bs, dtype=torch.int32, device=device,
         )
 
-        # Bind preallocated V4 page tables to metadata, sliced to [:bs, :].
         metadata.swa_page_table = self.graph_metadata["swa_page_table"][:bs, :]
         metadata.c4_page_table = self.graph_metadata["c4_page_table"][:bs, :]
         metadata.c128_page_table = self.graph_metadata["c128_page_table"][:bs, :]
         metadata.c4_state_page_table = self.graph_metadata["c4_state_page_table"][:bs, :]
         metadata.c128_state_page_table = self.graph_metadata["c128_state_page_table"][:bs, :]
 
-        # Per-capture-bs loc buffers. c{4,128}_loc is aligned with the fused
-        # compressor's padded output count, while c{4,128}_state_loc remains
-        # one slot per raw verify/draft token.
         n_tok = bs * tokens_per_bs
         c4_pad = min(n_tok, n_tok // 4 + bs)
         c128_pad = min(n_tok, n_tok // 128 + bs)
@@ -333,12 +311,6 @@ class DeepseekV4AscendAttnBackend(
         metadata.c4_state_loc = torch.zeros(n_tok, dtype=torch.int64, device=device)
         metadata.c128_state_loc = torch.zeros(n_tok, dtype=torch.int64, device=device)
 
-        # Fused-compressor metadata buffers. Decode-mode size for
-        # positions_cmp_padding is min(n_tok, n_tok//ratio + bs) which
-        # equals bs for decode (tokens_per_bs=1). For target_verify /
-        # draft modes, n_tok = bs * n_draft and the upper bound is
-        # bs * (n_draft // ratio + 1) ≤ n_tok; size n_tok covers both
-        # cases. int64 dtype matches what build_compress_locs emits.
         metadata.positions_cmp_padding_c4 = torch.zeros(
             c4_pad, dtype=torch.int64, device=device
         )
@@ -356,10 +328,6 @@ class DeepseekV4AscendAttnBackend(
             "li_quant_metadata": self.graph_metadata["kernel_metadata_li_quant"],
         }
 
-        # c4_topk_indices is preallocated in _init_dsv4_graph_buffers; bind a
-        # [:T, :] slice so the lazy seed in _forward_compressed sees a non-None
-        # tensor and skips its allocator. Real indexer.forward overwrites the
-        # contents via npu_quant_lightning_indexer at runtime.
         T = bs * tokens_per_bs
         metadata.c4_topk_indices = self.graph_metadata["c4_topk_indices"][:T, :]
 
@@ -376,19 +344,7 @@ class DeepseekV4AscendAttnBackend(
         spec_info: Optional["SpecInput"],
         seq_lens_cpu: Optional[torch.Tensor],
     ):
-        """In-place metadata refresh for V4-Flash graph replay.
-
-        Three phases:
-          1. Base class fills block_tables / seq_lens.
-          2. V4 kv lengths and q_cmp updated in place.
-          3. build_compress_locs / _kernel_metadata_from_parts results copied
-             into preallocated graph buffers.
-
-        All copies are .copy_(src) into existing tensors; no fresh allocations
-        on the graph stream. The live forward_batch is obtained from
-        self._replay_forward_batch, set by cuda_graph_runner.replay_prepare
-        before calling init_forward_metadata_replay_cuda_graph.
-        """
+        """Refresh preallocated DSV4 graph metadata for replay."""
         super().init_forward_metadata_replay_cuda_graph(
             bs=bs,
             req_pool_indices=req_pool_indices,
@@ -409,7 +365,6 @@ class DeepseekV4AscendAttnBackend(
                 "attn_backend._replay_forward_batch before calling replay_cuda_graph."
             )
 
-        # tokens_per_bs: matches base + capture branches on forward_mode.
         if (
             forward_mode.is_target_verify()
             or forward_mode.is_draft_extend_v2()
@@ -419,19 +374,6 @@ class DeepseekV4AscendAttnBackend(
         else:
             tokens_per_bs = 1
 
-        # Phase 2: kv lengths (and any spec-decode adjustment matches base).
-        # The base class above already adjusted seq_lens in-place for target_verify
-        # / decode+spec_info; copy the final adjusted values into fm.actual_seq_lengths_kv.
-        # fm.actual_seq_lengths_kv has shape (bs,) (bound in capture); clamp to 1 so
-        # padded slots (real seq_lens=0 beyond raw_bs) and capture-time zero seq_lens
-        # don't trip the kernel's seqused_kv >= 1 validation.
-        #
-        # Source: the device-side `seq_lens` arg is `buffers.seq_lens[:bs]` which is
-        # NOT populated under the NPU graph runner — that runner refreshes seq_lens
-        # for the captured graph via Graph.update(cpu_update_input={...}) targeting
-        # `actual_seq_lengths_kv` directly, leaving `buffers.seq_lens` at the init
-        # fill (0). The CPU param `seq_lens_cpu` IS populated (CPU-side .copy_ in
-        # populate_from_forward_batch is synchronous), so use it as the live source.
         assert seq_lens_cpu is not None, (
             "V4 graph replay requires seq_lens_cpu — buffers.seq_lens is stale on "
             "NPU (Graph.update only refreshes fm.actual_seq_lengths_kv inside the "
@@ -442,26 +384,23 @@ class DeepseekV4AscendAttnBackend(
         )
         attn_seq_lens = live_seq_lens
         if forward_mode.is_target_verify():
-            # Match eager AscendAttnBackend.init_forward_metadata: target_verify
-            # attention runs over the committed prefix plus all draft tokens.
-            # start_pos below still uses live_seq_lens so the fused compressor
-            # writes verify compressed state at the committed boundary.
             attn_seq_lens = live_seq_lens + int(tokens_per_bs)
             fm.seq_lens_cpu_int = (seq_lens_cpu[:bs] + int(tokens_per_bs)).int()
         fm.actual_seq_lengths_kv.copy_(attn_seq_lens.clamp(min=1))
 
-        # Phase 3: compress locs via shared helper.
         pool = forward_batch.token_to_kv_pool
         out_cache_loc = forward_batch.out_cache_loc
         device = seq_lens.device
 
         # Advance seq_lens for verify compress locs so the page table covers
         # [committed, committed+draft_token_num).
-        _verify_compress = (
+        _maybe_verify_compress = (
             forward_mode.is_target_verify()
-            and forward_batch.forward_mode.is_target_verify()
             and bool(self._dsv4_compress_ratios)
             and os.environ.get("SGLANG_DSV4_NPU_VERIFY_COMPRESS") != "0"
+        )
+        _verify_compress = (
+            _maybe_verify_compress and forward_batch.forward_mode.is_target_verify()
         )
         _compress_seq_lens = live_seq_lens
         if _verify_compress:
@@ -495,21 +434,18 @@ class DeepseekV4AscendAttnBackend(
                 dst = getattr(fm, key)
                 dst[: src.shape[0]].copy_(src)
                 dst[src.shape[0] :].fill_(0)
-
-        # Fused-compressor metadata (decode-path only; capture skips other modes).
-        # positions_cmp_padding tail stays 0 — which is a benign position used as
-        # padding and masked away by seqused at op time.
-        for key in (
-            "positions_cmp_padding_c4",
-            "positions_cmp_padding_c128",
-            "start_pos",
-            "seqused",
-        ):
-            if key in result and hasattr(fm, key) and getattr(fm, key) is not None:
-                src = result[key]
-                dst = getattr(fm, key)
-                dst[: src.shape[0]].copy_(src)
-                dst[src.shape[0] :].fill_(0)
+        if forward_mode.is_decode():
+            for key in (
+                "positions_cmp_padding_c4",
+                "positions_cmp_padding_c128",
+                "start_pos",
+                "seqused",
+            ):
+                if key in result:
+                    src = result[key]
+                    dst = getattr(fm, key)
+                    dst[: src.shape[0]].copy_(src)
+                    dst[src.shape[0] :].fill_(0)
 
         # Fused-compressor verify metadata (graph replay path). Rebuild the
         # compressor positions with the same ordering as the lkl_old
@@ -535,7 +471,6 @@ class DeepseekV4AscendAttnBackend(
                 self._dsv4_compress_ratios,
                 self.speculative_num_draft_tokens,
             )
-            # start_pos = committed (pre-verify KV length)
             fm.start_pos.copy_(live_seq_lens.to(torch.int32))
             valid = live_seq_lens[:bs] > 0
             fm.seqused.copy_(
@@ -558,17 +493,8 @@ class DeepseekV4AscendAttnBackend(
                     f"{loc.numel()} > {dst_loc.numel()}"
                 )
                 dst_loc[: loc.numel()].copy_(loc)
-        elif (
-            forward_mode.is_target_verify()
-            # The graph may replay a target-verify capture for an idle/padded
-            # DP rank. There is no real DSV4 allocation bundle in that case;
-            # zero the compressor metadata so captured writes land in the
-            # reserved dummy slot instead of reusing stale locs.
-            and not forward_batch.forward_mode.is_target_verify()
-            and bool(self._dsv4_compress_ratios)
-            and os.environ.get("SGLANG_DSV4_NPU_VERIFY_COMPRESS") != "0"
-        ):
-            # accuracy improved from 0.852 to 0.873 with graph
+        elif _maybe_verify_compress and not forward_batch.forward_mode.is_target_verify():
+            # Idle/padded DP rank: clear stale compressor metadata before graph replay.
             for tensor in (
                 fm.positions_cmp_padding_c4,
                 fm.positions_cmp_padding_c128,
@@ -577,8 +503,7 @@ class DeepseekV4AscendAttnBackend(
                 fm.c4_state_loc,
                 fm.c128_state_loc,
             ):
-                if tensor is not None:
-                    tensor.zero_()
+                tensor.zero_()
             fm.start_pos.zero_()
             fm.seqused.zero_()
 
@@ -598,26 +523,14 @@ class DeepseekV4AscendAttnBackend(
         )
         fm.swa_page_table.fill_(-1)
         fm.swa_page_table[: swa_src.shape[0], : swa_src.shape[1]].copy_(swa_src)
-        # The base graph replay 0-pads block_tables{,_swa} past the real pages
-        # (AscendAttnBackend: block_tables_swa[:bs, max_seq_pages:].fill_(0)). The
-        # full-width copy above thus overwrites the -1 sentinel with page id 0 in
-        # the tail, so the ori/swa sparse-attn kernel (oriMaxBlockNumPerBatch =
-        # block_table.shape[1], full width) could read page 0 past a request's
-        # real pages. Restore the -1 sentinel beyond the valid pages so swa
-        # matches the c4/c128 page tables (and the reference impl, which copies a
-        # tight src into a -1-filled buffer). max_seq_pages mirrors the base.
+        # Restore the -1 sentinel past valid SWA pages; base replay 0-pads tails.
         if bs > 0:
-            # Over-estimate max_len by the spec draft tokens (a safety margin):
-            # over-estimating only leaves a few extra 0s in the UNREAD tail,
-            # while under-estimating would -1 over valid pages. Plain decode
-            # adds 0.
             _spec = int(getattr(self, "speculative_num_draft_tokens", 0) or 0)
             max_len = int(seq_lens_cpu[:bs].max()) + _spec
             max_seq_pages = (max_len + self.page_size - 1) // self.page_size
             if 0 < max_seq_pages < fm.swa_page_table.shape[1]:
                 fm.swa_page_table[:, max_seq_pages:].fill_(-1)
 
-        # Kernel metadata refresh via shared helper from Task 1.
         kernel_metadata_new = self._kernel_metadata_from_parts(
             bs=bs,
             actual_seq_lengths_q_pa=fm.actual_seq_lengths_q_pa,
@@ -626,14 +539,10 @@ class DeepseekV4AscendAttnBackend(
             max_seqlen_q=tokens_per_bs,
             is_nextn=False,
         )
-        # In-place copy each entry into the preallocated kernel_metadata buffer.
         for key in ("c1a_metadata", "c4a_metadata", "c128a_metadata", "li_quant_metadata"):
             if key in kernel_metadata_new:
                 fm.kernel_metadata[key].copy_(kernel_metadata_new[key])
 
-        # Reset c4_topk_indices to the -1 sentinel before the captured forward
-        # runs. The indexer will overwrite valid entries; any unset rows must
-        # read -1 (= "no sparse index") to keep npu_sparse_attn_sharedkv stable.
         fm.c4_topk_indices.fill_(-1)
 
         self.forward_metadata = fm
@@ -642,17 +551,7 @@ class DeepseekV4AscendAttnBackend(
         super().init_forward_metadata(forward_batch)
         fm = self.forward_metadata
 
-        # DP-attention IDLE ranks get a padded batch (bs>0) but seq_lens are
-        # all zero. The sparse-attn metadata kernel
-        # (npu_sparse_attn_sharedkv_metadata) doesn't accept this shape; even
-        # after clamping seqused_kv it tries to read the request's page table
-        # at positions that were never written, which surfaces as an AICPU
-        # exception (errcode 0x2a / runtime 507018) on the next sync.
-        # The rest of the V4 backend already treats IDLE as a no-op (see
-        # forward_compress / forward_c4_indexer below), so we mirror that
-        # contract here: stash empty-but-typed defaults on fm so any later
-        # attribute access stays well-defined, then return without invoking
-        # any sparse-attn metadata kernels.
+        # IDLE ranks do not run V4 sparse-attn metadata kernels.
         if forward_batch.forward_mode.is_idle():
             fm.actual_seq_lengths_q = None
             fm.actual_seq_lengths_q_pa = None
@@ -660,22 +559,7 @@ class DeepseekV4AscendAttnBackend(
             fm.kernel_metadata = {}
             return
 
-        # Build TND cu_seqlens_q (= cumulative QUERY seq lens, int32 device tensor).
-        # The kernel uses cu_seqlens_q to slice the q tensor by request, so
-        # the per-request length here must equal the per-request token count
-        # in q — NOT the KV/context length.
-        #
-        #   extend / prefill: q has extend_seq_lens_cpu tokens per request →
-        #                     cumsum(extend_seq_lens_cpu).
-        #   decode:           q has exactly 1 new token per request → [1, 1, ..., 1].
-        #   target_verify /
-        #   draft_extend:     q has speculative_num_draft_tokens per request.
-        #
-        # Earlier this branch fell back to `forward_batch.seq_lens_cpu` (the
-        # full KV length) on the non-extend path, which made the kernel slice
-        # q at offset = full_seq_len while q.shape[0] = batch_size for decode.
-        # That is the V4-NPU root cause of token-1+ divergence — kernel
-        # metadata says q has e.g. 257 tokens but q tensor only has 1.
+        # cu_seqlens_q is query-token length, not KV/context length.
         device = forward_batch.seq_lens.device
         if (
             forward_batch.forward_mode.is_extend()
@@ -727,16 +611,10 @@ class DeepseekV4AscendAttnBackend(
             else None
         )
 
-        # SWA page table -- populated by AscendAttnBackend when the model is
-        # hybrid-SWA, else None. Aliased under the name forward_sparse uses.
-        # Use explicit `is not None` check (not `or`) because
-        # `bool(multi-element tensor)` raises.
         fm.swa_page_table = (
             fm.block_tables_swa if fm.block_tables_swa is not None else fm.block_tables
         )
 
-        # actual_seq_lengths_kv defaults to None on main; the V4 metadata
-        # kernel needs an int32 device tensor of per-request KV lengths.
         if fm.actual_seq_lengths_kv is None:
             if fm.seq_lens_cpu_int is not None:
                 fm.actual_seq_lengths_kv = fm.seq_lens_cpu_int.to(
@@ -745,15 +623,8 @@ class DeepseekV4AscendAttnBackend(
             else:
                 fm.actual_seq_lengths_kv = forward_batch.seq_lens.to(torch.int32)
 
-        # Build kernel_metadata dict. For V4-Flash we mainly need c1a (no
-        # compress KV) right now; c4a/c128a follow when we add those paths.
         fm.kernel_metadata = self._compute_kernel_metadata(forward_batch)
 
-        # NPU compress metadata: per-request tensors consumed by
-        # dsv4/{compressor,indexer}.py forward_npu. There is no per-ratio
-        # req_to_token mapping in the request pool, so we compute the
-        # equivalent on the fly from req_to_token + the V4 KV pool's
-        # swa translation.
         if self._dsv4_compress_ratios:
             self._build_npu_compress_metadata(forward_batch)
 
@@ -1101,9 +972,9 @@ class DeepseekV4AscendAttnBackend(
         attn_sink: Optional[torch.Tensor] = None,
         save_kv_cache: bool = True,
     ) -> torch.Tensor:
-        if compress_ratio not in (0, 1, 4, 128):
+        if compress_ratio not in (0, 4, 128):
             raise ValueError(
-                f"V4 attention expects compress_ratio in (0, 1, 4, 128); got {compress_ratio}"
+                f"V4 attention expects compress_ratio in (0, 4, 128); got {compress_ratio}"
             )
         # DP-attention IDLE short-circuit. Idle ranks run model.forward only to
         # participate in the downstream MoE collective (deepep dispatch/combine
@@ -1125,7 +996,7 @@ class DeepseekV4AscendAttnBackend(
             self.store_cache(
                 layer_id=layer.layer_id, swa_k=k, forward_batch=forward_batch
             )
-        if compress_ratio in (0, 1):
+        if compress_ratio == 0:
             return self._forward_dense(q, layer, forward_batch, attn_sink)
         # ratio 4 / 128: sparse compressed-KV path via npu_sparse_attn_sharedkv
         # with has_cmp_kv=True.
@@ -1140,7 +1011,7 @@ class DeepseekV4AscendAttnBackend(
         forward_batch: "ForwardBatch",
         attn_sink: Optional[torch.Tensor],
     ) -> torch.Tensor:
-        """ratio=1 / ratio=0 dense layers — sliding-window attention via
+        """ratio=0 dense layers — sliding-window attention via
         npu_sparse_attn_sharedkv with has_cmp_kv=False."""
         fm = self.forward_metadata
         pool = forward_batch.token_to_kv_pool

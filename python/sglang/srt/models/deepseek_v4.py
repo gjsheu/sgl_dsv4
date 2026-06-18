@@ -201,15 +201,14 @@ class MQALayer(nn.Module):
             else config.compress_ratios[layer_id]
         )
 
-        # V4-Flash uses ratio=1 for dense (uncompressed) edge layers. Treat
-        # ratios 0 and 1 the same: neither creates Compressor/C4Indexer state.
+        # V4-Flash modelslim uses ratio=0 for dense edge layers. These layers
+        # do not create Compressor/C4Indexer state.
         assert compress_ratio in (
             0,
-            1,
             4,
             128,
-        ), f"V4 compress_ratio: expected one of (0, 1, 4, 128), got {compress_ratio}"
-        self.compress_ratio: Literal[0, 1, 4, 128] = compress_ratio
+        ), f"V4 compress_ratio: expected one of (0, 4, 128), got {compress_ratio}"
+        self.compress_ratio: Literal[0, 4, 128] = compress_ratio
 
         assert self.head_dim == config.head_dim
         assert config.num_key_value_heads == 1
