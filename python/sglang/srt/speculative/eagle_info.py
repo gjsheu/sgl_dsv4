@@ -144,15 +144,11 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
                 batch.req_pool_indices,
                 prefix_lens,
             )
-            _verify_compress = (
-                os.environ.get("SGLANG_DSV4_NPU_VERIFY_COMPRESS") != "0"
-            )
             _dsv4_state_lens = None
-            if _verify_compress:
-                batch._compute_dsv4_state_lens_verify(
-                    prefix_lens_cpu.tolist(), self.draft_token_num
-                )
-                _dsv4_state_lens = getattr(batch, "dsv4_state_lens", None)
+            batch._compute_dsv4_state_lens_verify(
+                prefix_lens_cpu.tolist(), self.draft_token_num
+            )
+            _dsv4_state_lens = getattr(batch, "dsv4_state_lens", None)
 
             batch.out_cache_loc = alloc_paged_token_slots_extend(
                 batch.tree_cache,
@@ -181,13 +177,12 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
                     end_offset_cpu,
                 )
 
-            if _verify_compress:
-                for _req in batch.reqs:
-                    if hasattr(_req, "_dsv4_swa_c4_off"):
-                        _req.c4_state_alloc_offset = _req._dsv4_swa_c4_off
-                        _req.c128_state_alloc_offset = _req._dsv4_swa_c128_off
-                        del _req._dsv4_swa_c4_off
-                        del _req._dsv4_swa_c128_off
+            for _req in batch.reqs:
+                if hasattr(_req, "_dsv4_swa_c4_off"):
+                    _req.c4_state_alloc_offset = _req._dsv4_swa_c4_off
+                    _req.c128_state_alloc_offset = _req._dsv4_swa_c128_off
+                    del _req._dsv4_swa_c4_off
+                    del _req._dsv4_swa_c128_off
 
         bs = batch.batch_size()
         assign_req_to_token_pool_func(
@@ -507,63 +502,62 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
             req.update_spec_correct_drafts_histogram(num_correct_drafts_this_req)
             _dsv4_accept_lens.append(num_accept_tokens)
 
-        if os.environ.get("SGLANG_DSV4_NPU_VERIFY_COMPRESS") != "0":
-            _alloc = batch.tree_cache.token_to_kv_pool_allocator
-            if (
-                hasattr(_alloc, "c4_state_attn_allocator")
-                and _alloc.c4_state_attn_allocator is not None
-            ):
-                from sglang.srt.hardware_backend.npu.dsv4_common_hooks import (
-                    free_rejected_compress_pages,
-                )
+        _alloc = batch.tree_cache.token_to_kv_pool_allocator
+        if (
+            hasattr(_alloc, "c4_state_attn_allocator")
+            and _alloc.c4_state_attn_allocator is not None
+        ):
+            from sglang.srt.hardware_backend.npu.dsv4_common_hooks import (
+                free_rejected_compress_pages,
+            )
 
-                _rtp = batch.req_to_token_pool
-                _nd = self.draft_token_num
-                _rpi = batch.req_pool_indices.tolist()
-                _page = batch.tree_cache.page_size
-                for _i, _req in enumerate(batch.reqs):
-                    _c0 = getattr(_req, "_dsv4_verify_committed", None)
-                    if hasattr(_req, "_dsv4_verify_committed"):
-                        del _req._dsv4_verify_committed
-                    _K = _dsv4_accept_lens[_i]
-                    _nrej = _nd - _K
-                    if _nrej <= 0 or _c0 is None:
-                        continue
-                    _ridx = _rpi[_i]
-                    # Return the slots speculatively reserved for the rejected
-                    # draft tokens [_c0+_K, _c0+_nd). The paged allocator frees by
-                    # whole page, so free_rejected_compress_pages only releases
-                    # fully-rejected fresh pages; mid-page slots are reused in
-                    # place next step (state rolls its length back below; the
-                    # c4/c128 KV length is kv_committed_len-derived and already
-                    # rolled back). Without this, rejected c4/c128 KV pages leak
-                    # and the old per-slot state free returned still-live pages
-                    # (cross-request state aliasing).
-                    # State pools: raw-position indexed.
-                    free_rejected_compress_pages(
-                        _alloc.c4_state_attn_allocator,
-                        _rtp.req_to_token_c4_state[_ridx],
-                        _c0 + _K, _c0 + _nd, _page,
-                    )
-                    free_rejected_compress_pages(
-                        _alloc.c128_state_attn_allocator,
-                        _rtp.req_to_token_c128_state[_ridx],
-                        _c0 + _K, _c0 + _nd, _page,
-                    )
-                    # Compressed-KV pools: compressed-position indexed (a rejected
-                    # token only consumes a slot when it closes a //ratio token).
-                    free_rejected_compress_pages(
-                        getattr(_alloc, "c4_attn_allocator", None),
-                        _rtp.req_to_token_c4[_ridx],
-                        (_c0 + _K) // 4, (_c0 + _nd) // 4, _page,
-                    )
-                    free_rejected_compress_pages(
-                        getattr(_alloc, "c128_attn_allocator", None),
-                        _rtp.req_to_token_c128[_ridx],
-                        (_c0 + _K) // 128, (_c0 + _nd) // 128, _page,
-                    )
-                    _req.c4_state_kv_len -= _nrej
-                    _req.c128_state_kv_len -= _nrej
+            _rtp = batch.req_to_token_pool
+            _nd = self.draft_token_num
+            _rpi = batch.req_pool_indices.tolist()
+            _page = batch.tree_cache.page_size
+            for _i, _req in enumerate(batch.reqs):
+                _c0 = getattr(_req, "_dsv4_verify_committed", None)
+                if hasattr(_req, "_dsv4_verify_committed"):
+                    del _req._dsv4_verify_committed
+                _K = _dsv4_accept_lens[_i]
+                _nrej = _nd - _K
+                if _nrej <= 0 or _c0 is None:
+                    continue
+                _ridx = _rpi[_i]
+                # Return the slots speculatively reserved for the rejected
+                # draft tokens [_c0+_K, _c0+_nd). The paged allocator frees by
+                # whole page, so free_rejected_compress_pages only releases
+                # fully-rejected fresh pages; mid-page slots are reused in
+                # place next step (state rolls its length back below; the
+                # c4/c128 KV length is kv_committed_len-derived and already
+                # rolled back). Without this, rejected c4/c128 KV pages leak
+                # and the old per-slot state free returned still-live pages
+                # (cross-request state aliasing).
+                # State pools: raw-position indexed.
+                free_rejected_compress_pages(
+                    _alloc.c4_state_attn_allocator,
+                    _rtp.req_to_token_c4_state[_ridx],
+                    _c0 + _K, _c0 + _nd, _page,
+                )
+                free_rejected_compress_pages(
+                    _alloc.c128_state_attn_allocator,
+                    _rtp.req_to_token_c128_state[_ridx],
+                    _c0 + _K, _c0 + _nd, _page,
+                )
+                # Compressed-KV pools: compressed-position indexed (a rejected
+                # token only consumes a slot when it closes a //ratio token).
+                free_rejected_compress_pages(
+                    getattr(_alloc, "c4_attn_allocator", None),
+                    _rtp.req_to_token_c4[_ridx],
+                    (_c0 + _K) // 4, (_c0 + _nd) // 4, _page,
+                )
+                free_rejected_compress_pages(
+                    getattr(_alloc, "c128_attn_allocator", None),
+                    _rtp.req_to_token_c128[_ridx],
+                    (_c0 + _K) // 128, (_c0 + _nd) // 128, _page,
+                )
+                _req.c4_state_kv_len -= _nrej
+                _req.c128_state_kv_len -= _nrej
 
         if has_finished:
             num_correct_drafts = (accept_index != -1).sum(dim=1) - 1

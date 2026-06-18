@@ -76,7 +76,6 @@ class CompressorAscendBackendMixin(CompressorBackendMixin):
         _verify_compress = (
             is_verify
             and bool(self._dsv4_compress_ratios)
-            and os.environ.get("SGLANG_DSV4_NPU_VERIFY_COMPRESS") != "0"
         )
         _seq_lens = forward_batch.seq_lens.to(torch.int32)
         if _verify_compress:
@@ -315,12 +314,6 @@ class CompressorAscendBackendMixin(CompressorBackendMixin):
         x: torch.Tensor,
         forward_batch: ForwardBatch,
     ) -> None:
-        if (
-            forward_batch.forward_mode.is_target_verify()
-            and os.environ.get("SGLANG_DSV4_NPU_VERIFY_COMPRESS") == "0"
-        ):
-            return
-
         from sglang.srt.layers.deepseek_v4_rope import (
             get_fused_compressor_rope_cos_sin,
         )
@@ -1208,8 +1201,8 @@ class DeepseekV4AscendAttnBackend(
 
         _verify_compress = (
             forward_mode.is_target_verify()
+            and forward_batch.forward_mode.is_target_verify()
             and bool(self._dsv4_compress_ratios)
-            and os.environ.get("SGLANG_DSV4_NPU_VERIFY_COMPRESS") != "0"
         )
         _compress_seq_lens = live_seq_lens
         if _verify_compress:
@@ -1299,6 +1292,28 @@ class DeepseekV4AscendAttnBackend(
                                 f"{bl32.numel()} > {dst_loc.numel()}"
                             )
                             dst_loc[: bl32.numel()].copy_(bl32)
+
+        elif (
+            forward_mode.is_target_verify()
+            # The graph may replay a target-verify capture for an idle/padded
+            # DP rank. There is no real DSV4 allocation bundle in that case;
+            # zero the compressor metadata so captured writes land in the
+            # reserved dummy slot instead of reusing stale locs.
+            and not forward_batch.forward_mode.is_target_verify()
+            and bool(self._dsv4_compress_ratios)
+        ):
+            for tensor in (
+                fm.positions_cmp_padding_c4,
+                fm.positions_cmp_padding_c128,
+                fm.c4_loc,
+                fm.c128_loc,
+                fm.c4_state_loc,
+                fm.c128_state_loc,
+            ):
+                if tensor is not None:
+                    tensor.zero_()
+            fm.start_pos.zero_()
+            fm.seqused.zero_()
 
         swa_loc = pool.translate_loc_from_full_to_swa(out_cache_loc).to(torch.int64)
         _copy_1d(fm.swa_loc, swa_loc)
