@@ -5,7 +5,7 @@ NPU counterpart of the CUDA ``DeepseekV4AttnBackend``. Bridges V4 model code
 of ``AttentionBackend``) with ``AscendAttnBackend``. MRO: ``AscendAttnBackend``
 supplies the NPU forward / metadata surface; the V4 mixins add the c4 / c128
 compress + indexer helpers. ``forward()`` routes by ``compress_ratio``:
-0 / 1 → dense SWA (``_forward_dense``), 4 / 128 → sparse compressed
+0 → dense SWA (``_forward_dense``), 4 / 128 → sparse compressed
 (``_forward_compressed`` via ``npu_sparse_attn_sharedkv``).
 """
 
@@ -1495,9 +1495,9 @@ class DeepseekV4AscendAttnBackend(
         attn_sink: Optional[torch.Tensor] = None,
         save_kv_cache: bool = True,
     ) -> torch.Tensor:
-        if compress_ratio not in (0, 1, 4, 128):
+        if compress_ratio not in (0, 4, 128):
             raise ValueError(
-                f"V4 attention expects compress_ratio in (0, 1, 4, 128); got {compress_ratio}"
+                f"V4 attention expects compress_ratio in (0, 4, 128); got {compress_ratio}"
             )
         # DP-attention IDLE short-circuit. Idle ranks run model.forward only to
         # participate in the downstream MoE collective (deepep dispatch/combine
@@ -1519,7 +1519,7 @@ class DeepseekV4AscendAttnBackend(
             self.store_cache(
                 layer_id=layer.layer_id, swa_k=k, forward_batch=forward_batch
             )
-        if compress_ratio in (0, 1):
+        if compress_ratio == 0:
             return self._forward_dense(q, layer, forward_batch, attn_sink)
         # ratio 4 / 128: sparse compressed-KV path via npu_sparse_attn_sharedkv
         # with has_cmp_kv=True.
@@ -1534,7 +1534,7 @@ class DeepseekV4AscendAttnBackend(
         forward_batch: "ForwardBatch",
         attn_sink: Optional[torch.Tensor],
     ) -> torch.Tensor:
-        """ratio=1 / ratio=0 dense layers — sliding-window attention via
+        """ratio=0 dense layers — sliding-window attention via
         npu_sparse_attn_sharedkv with has_cmp_kv=False."""
         fm = self.forward_metadata
         pool = forward_batch.token_to_kv_pool
