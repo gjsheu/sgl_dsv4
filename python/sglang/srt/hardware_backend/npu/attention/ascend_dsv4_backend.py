@@ -123,6 +123,9 @@ class DeepseekV4AscendAttnBackend(
         # c{4,128} metadata entirely.
         if getattr(model_runner, "is_draft_worker", False):
             self._dsv4_compress_ratios = type(hf.compress_ratios)()
+        self._dsv4_unique_compress_ratios = list(
+            dict.fromkeys(self._dsv4_compress_ratios)
+        )
         self._dsv4_has_c4 = 4 in self._dsv4_compress_ratios
         self._dsv4_has_c128 = 128 in self._dsv4_compress_ratios
         self._dsv4_sliding_window_size = (
@@ -543,7 +546,7 @@ class DeepseekV4AscendAttnBackend(
                 raise RuntimeError(
                     "DSV4 graph verify compression requires out_cache_loc_dsv4."
                 )
-            for ratio in self._dsv4_compress_ratios:
+            for ratio in self._dsv4_unique_compress_ratios:
                 if ratio not in (4, 128):
                     continue
                 bundle_loc = bundle.out_c4_loc if ratio == 4 else bundle.out_c128_loc
@@ -909,7 +912,7 @@ class DeepseekV4AscendAttnBackend(
         # result; the eager contract was that those fm fields are None in
         # non-decode mode. Replay (Task 5) checks key presence instead.
         if not is_decode:
-            for ratio in self._dsv4_compress_ratios:
+            for ratio in self._dsv4_unique_compress_ratios:
                 if ratio in (4, 128):
                     if f"c{ratio}_state_loc" not in result:
                         setattr(fm, f"c{ratio}_state_loc", None)
@@ -970,7 +973,7 @@ class DeepseekV4AscendAttnBackend(
             raise RuntimeError(
                 "DSV4 target verify compression requires out_cache_loc_dsv4."
             )
-        for ratio in self._dsv4_compress_ratios:
+        for ratio in self._dsv4_unique_compress_ratios:
             if ratio not in (4, 128):
                 continue
             bundle_loc = bundle.out_c4_loc if ratio == 4 else bundle.out_c128_loc
