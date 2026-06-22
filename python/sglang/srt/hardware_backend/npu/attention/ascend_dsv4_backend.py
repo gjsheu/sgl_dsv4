@@ -124,7 +124,7 @@ class CompressorAscendBackendMixin(CompressorBackendMixin):
         cu = fm.actual_seq_lengths_q_pa
 
         cu_cpu = cu.cpu().tolist()
-        ratio_lists: dict = {r: [] for r in self._dsv4_compress_ratios if r in (4, 128)}
+        ratio_lists: dict = {r: [] for r in self._dsv4_unique_compress_ratios if r in (4, 128)}
         for idx in range(bs):
             start = int(cu_cpu[idx])
             end = int(cu_cpu[idx + 1])
@@ -210,7 +210,7 @@ class CompressorAscendBackendMixin(CompressorBackendMixin):
         seq_lens_max = int(seq_lens.max().item()) if bs > 0 else 0
         n_pages = max(1, (seq_lens_max + self.page_size - 1) // self.page_size)
 
-        for ratio in self._dsv4_compress_ratios:
+        for ratio in self._dsv4_unique_compress_ratios:
             if ratio not in (4, 128):
                 continue
             state_table = (
@@ -277,7 +277,7 @@ class CompressorAscendBackendMixin(CompressorBackendMixin):
         if is_decode:
             valid = seq_lens > 0
             positions_last = torch.clamp(seq_lens - 1, min=0)
-            for ratio in self._dsv4_compress_ratios:
+            for ratio in self._dsv4_unique_compress_ratios:
                 if ratio not in (4, 128):
                     continue
                 padding_size = min(bs, bs // ratio + bs)
@@ -1019,6 +1019,9 @@ class DeepseekV4AscendAttnBackend(
         self._dsv4_sliding_window_size = (
             cfg.sliding_window_size if cfg.sliding_window_size is not None else 128
         )
+        self._dsv4_unique_compress_ratios = list(
+            dict.fromkeys(self._dsv4_compress_ratios)
+        )
 
 
     def _init_dsv4_graph_buffers(self, *, max_bs: int, max_num_tokens: int) -> None:
@@ -1278,7 +1281,7 @@ class DeepseekV4AscendAttnBackend(
             )
             _bundle = getattr(forward_batch, "out_cache_loc_dsv4", None)
             if _bundle is not None:
-                for ratio in self._dsv4_compress_ratios:
+                for ratio in self._dsv4_unique_compress_ratios:
                     if ratio not in (4, 128):
                         continue
                     bl = _bundle.out_c4_loc if ratio == 4 else _bundle.out_c128_loc
@@ -1552,7 +1555,7 @@ class DeepseekV4AscendAttnBackend(
             self.store_cache(
                 layer_id=layer.layer_id, swa_k=k, forward_batch=forward_batch
             )
-        if compress_ratio in (0, 1):
+        if compress_ratio == 0:
             return self._forward_dense(q, layer, forward_batch, attn_sink)
         return self._forward_compressed(
             q, layer, forward_batch, attn_sink, compress_ratio
@@ -1565,6 +1568,8 @@ class DeepseekV4AscendAttnBackend(
         forward_batch: "ForwardBatch",
         attn_sink: Optional[torch.Tensor],
     ) -> torch.Tensor:
+        """ratio=0 dense layers — sliding-window attention via
+        npu_sparse_attn_sharedkv with has_cmp_kv=False."""
         fm = self.forward_metadata
         pool = forward_batch.token_to_kv_pool
         ori_kv = pool.get_swa_buffer(layer.layer_id)
@@ -1687,7 +1692,7 @@ class DeepseekV4AscendAttnBackend(
         fm.seqused = None
         _bundle = getattr(forward_batch, "out_cache_loc_dsv4", None)
         if _bundle is not None:
-            for ratio in self._dsv4_compress_ratios:
+            for ratio in self._dsv4_unique_compress_ratios:
                 if ratio not in (4, 128):
                     continue
                 bl = _bundle.out_c4_loc if ratio == 4 else _bundle.out_c128_loc
